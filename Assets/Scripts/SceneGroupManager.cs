@@ -2,7 +2,11 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Eflatun.SceneReference;
 using UnityEngine;
+using UnityEngine.AddressableAssets;
+using UnityEngine.ResourceManagement.AsyncOperations;
+using UnityEngine.ResourceManagement.ResourceProviders;
 using UnityEngine.SceneManagement;
 
 namespace Systems.SceneManagement
@@ -27,6 +31,11 @@ namespace Systems.SceneManagement
         /// </summary>
         public event Action OnSceneGroupLoaded = delegate { };
 
+        /// <summary>
+        /// 用于管理Addressable场景加载句柄的组。
+        /// </summary>
+        private readonly AsyncOperationHandleGroup handleGroup = new AsyncOperationHandleGroup(10);
+        
         /// <summary>
         /// 当前激活的场景组。
         /// </summary>
@@ -65,23 +74,30 @@ namespace Systems.SceneManagement
                 var sceneData = group.Scenes[i];
                 // 如果不允许重复加载且场景已存在，则跳过
                 if (reloadDupScenes == false && loadedScenes.Contains(sceneData.Name)) continue;
-
-                // 异步加载场景
-                var operation = SceneManager.LoadSceneAsync(sceneData.Reference.Path, LoadSceneMode.Additive);
-
-                // 模拟延迟
-                // await Task.Delay(TimeSpan.FromSeconds(2.5f));   //TODO：移除
-
-                operationGroup.Operations.Add(operation);
-
+                
+                // 根据场景引用的状态决定加载方式
+                if (sceneData.Reference.State == SceneReferenceState.Regular)
+                {
+                    // 异步加载常规场景
+                    var operation = SceneManager.LoadSceneAsync(sceneData.Reference.Path, LoadSceneMode.Additive);
+                    operationGroup.Operations.Add(operation);
+                }
+                else if (sceneData.Reference.State == SceneReferenceState.Addressable)
+                {
+                    // 异步加载Addressable场景
+                    var sceneHandle = Addressables.LoadSceneAsync(sceneData.Reference.Path, LoadSceneMode.Additive);
+                    handleGroup.Handles.Add(sceneHandle);
+                }
+                
                 // 触发场景加载事件
                 OnSceneLoaded.Invoke(sceneData.Name);
             }
 
             // 等待所有异步操作完成，并报告进度
-            while (!operationGroup.IsDone)
+            while (!operationGroup.IsDone || !handleGroup.IsDone)
             {
-                progress?.Report(operationGroup.Progress);
+                // 计算并报告平均进度
+                progress?.Report((operationGroup.Progress + handleGroup.Progress) / 2);
                 await Task.Delay(100);
             }
 
@@ -118,6 +134,9 @@ namespace Systems.SceneManagement
                 var sceneName = sceneAt.name;
                 // 跳过活动场景和启动场景
                 if (sceneName.Equals(activeScene) || sceneName == "Bootstrapper") continue;
+                // 跳过由Addressable加载的场景
+                if (handleGroup.Handles.Any(h => h.IsValid() && h.Result.Scene.name == sceneName)) continue;
+                
                 scenes.Add(sceneName);
             }
 
@@ -134,6 +153,16 @@ namespace Systems.SceneManagement
                 // 触发场景卸载事件
                 OnSceneUnloaded.Invoke(scene);
             }
+
+            // 卸载所有Addressable场景
+            foreach (var handle in handleGroup.Handles)
+            {
+                if (handle.IsValid())
+                {
+                    Addressables.UnloadSceneAsync(handle);
+                }
+            }
+            handleGroup.Handles.Clear();
 
             // 等待所有异步操作完成
             while (!operationGroup.IsDone)
@@ -173,6 +202,36 @@ namespace Systems.SceneManagement
         public AsyncOperationGroup(int initialCapacity)
         {
             Operations = new List<AsyncOperation>(initialCapacity);
+        }
+    }
+
+    /// <summary>
+    /// 表示一组Addressable异步操作句柄的结构体，用于跟踪多个Addressable场景加载或卸载操作的进度和状态。
+    /// </summary>
+    public readonly struct AsyncOperationHandleGroup
+    {
+        /// <summary>
+        /// 包含所有Addressable异步操作句柄的列表。
+        /// </summary>
+        public readonly List<AsyncOperationHandle<SceneInstance>> Handles;
+
+        /// <summary>
+        /// 获取所有句柄的平均进度。
+        /// </summary>
+        public float Progress => Handles.Count == 0 ? 0 : Handles.Average(h => h.PercentComplete);
+
+        /// <summary>
+        /// 检查所有句柄是否已完成。
+        /// </summary>
+        public bool IsDone => Handles.Count == 0 || Handles.All(o => o.IsDone);
+        
+        /// <summary>
+        /// 初始化一个新的Addressable异步操作句柄组实例。
+        /// </summary>
+        /// <param name="initialCapacity">初始容量，用于预分配列表空间。</param>
+        public AsyncOperationHandleGroup(int initialCapacity)
+        {
+            Handles = new List<AsyncOperationHandle<SceneInstance>>(initialCapacity);
         }
     }
 }
